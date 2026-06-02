@@ -4,8 +4,7 @@ use crate::attestation::store_attestation;
 use crate::events::Events;
 use crate::storage::Storage;
 use crate::types::{
-    Attestation, AttestationOrigin, Error, IssuerTier, MultiSigProposal,
-    MULTISIG_PROPOSAL_TTL_SECS,
+    Attestation, AttestationOrigin, Error, IssuerTier, MultiSigProposal, SECS_PER_DAY,
 };
 use crate::validation::Validation;
 
@@ -64,6 +63,7 @@ pub fn propose_attestation(
     let proposal_id = MultiSigProposal::generate_id(env, &proposer, &subject, &claim_type, timestamp);
     let mut signers = Vec::new(env);
     signers.push_back(proposer.clone());
+    let ttl_days = Storage::get_multisig_ttl_days(env);
     let proposal = MultiSigProposal {
         id: proposal_id.clone(),
         proposer: proposer.clone(),
@@ -73,7 +73,7 @@ pub fn propose_attestation(
         threshold,
         signers,
         created_at: timestamp,
-        expires_at: timestamp + MULTISIG_PROPOSAL_TTL_SECS,
+        expires_at: timestamp + u64::from(ttl_days) * SECS_PER_DAY,
         finalized: false,
     };
     Storage::set_multisig_proposal(env, &proposal);
@@ -137,6 +137,28 @@ pub fn cosign_attestation(env: &Env, issuer: Address, proposal_id: String) -> Re
     } else {
         Storage::set_multisig_proposal(env, &proposal);
     }
+    Ok(())
+}
+
+pub fn cancel_multisig_proposal(env: &Env, proposer: Address, proposal_id: String) -> Result<(), Error> {
+    proposer.require_auth();
+
+    let mut proposal = Storage::get_multisig_proposal(env, &proposal_id)?;
+    if proposal.proposer != proposer {
+        return Err(Error::Unauthorized);
+    }
+    if proposal.finalized {
+        return Err(Error::ProposalFinalized);
+    }
+
+    let current_time = env.ledger().timestamp();
+    if current_time >= proposal.expires_at {
+        return Err(Error::ProposalExpired);
+    }
+
+    proposal.expires_at = current_time;
+    Storage::set_multisig_proposal(env, &proposal);
+    Events::multisig_cancelled(env, &proposal_id, &proposer);
     Ok(())
 }
 

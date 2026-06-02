@@ -1777,6 +1777,93 @@ fn test_multisig_expired_proposal_rejected() {
 }
 
 #[test]
+fn test_multisig_ttl_can_be_configured_by_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (issuer1, issuer2, issuer3, admin, client) = setup_multisig(&env);
+    let subject = Address::generate(&env);
+    let claim_type = String::from_str(&env, "ACCREDITED_INVESTOR");
+
+    assert_eq!(client.get_multisig_ttl(), 7);
+    client.set_multisig_ttl(&admin, &10);
+    assert_eq!(client.get_multisig_ttl(), 10);
+
+    let mut required = soroban_sdk::Vec::new(&env);
+    required.push_back(issuer1.clone());
+    required.push_back(issuer2.clone());
+    required.push_back(issuer3.clone());
+
+    let proposal_id = client.propose_attestation(&issuer1, &subject, &claim_type, &required, &2);
+
+    env.ledger().with_mut(|li| li.timestamp = 1_000 + 10 * 24 * 60 * 60 + 1);
+
+    let result = client.try_cosign_attestation(&issuer2, &proposal_id);
+    assert_eq!(result, Err(Ok(types::Error::ProposalExpired)));
+}
+
+#[test]
+fn test_proposer_can_cancel_multisig_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (issuer1, issuer2, issuer3, _, client) = setup_multisig(&env);
+    let subject = Address::generate(&env);
+    let claim_type = String::from_str(&env, "ACCREDITED_INVESTOR");
+
+    let mut required = soroban_sdk::Vec::new(&env);
+    required.push_back(issuer1.clone());
+    required.push_back(issuer2.clone());
+    required.push_back(issuer3.clone());
+
+    let proposal_id = client.propose_attestation(&issuer1, &subject, &claim_type, &required, &2);
+    client.cancel_multisig_proposal(&issuer1, &proposal_id);
+
+    let result = client.try_cosign_attestation(&issuer2, &proposal_id);
+    assert_eq!(result, Err(Ok(types::Error::ProposalExpired)));
+}
+
+#[test]
+fn test_non_proposer_cannot_cancel_multisig_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (issuer1, issuer2, issuer3, _, client) = setup_multisig(&env);
+    let subject = Address::generate(&env);
+    let claim_type = String::from_str(&env, "ACCREDITED_INVESTOR");
+
+    let mut required = soroban_sdk::Vec::new(&env);
+    required.push_back(issuer1.clone());
+    required.push_back(issuer2.clone());
+    required.push_back(issuer3.clone());
+
+    let proposal_id = client.propose_attestation(&issuer1, &subject, &claim_type, &required, &2);
+    let result = client.try_cancel_multisig_proposal(&issuer2, &proposal_id);
+    assert_eq!(result, Err(Ok(types::Error::Unauthorized)));
+}
+
+#[test]
+fn test_cancelled_multisig_proposal_rejected_when_finalized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (issuer1, issuer2, issuer3, _, client) = setup_multisig(&env);
+    let subject = Address::generate(&env);
+    let claim_type = String::from_str(&env, "ACCREDITED_INVESTOR");
+
+    let mut required = soroban_sdk::Vec::new(&env);
+    required.push_back(issuer1.clone());
+    required.push_back(issuer2.clone());
+    required.push_back(issuer3.clone());
+
+    let proposal_id = client.propose_attestation(&issuer1, &subject, &claim_type, &required, &2);
+    client.cosign_attestation(&issuer2, &proposal_id);
+
+    let result = client.try_cancel_multisig_proposal(&issuer1, &proposal_id);
+    assert_eq!(result, Err(Ok(types::Error::ProposalFinalized)));
+}
+
+#[test]
 fn test_multisig_invalid_threshold_rejected() {
     let env = Env::default();
     env.mock_all_auths();

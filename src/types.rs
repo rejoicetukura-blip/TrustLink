@@ -137,6 +137,7 @@ pub struct ContractConfig {
     pub fee_config: FeeConfig,
     pub ttl_config: TtlConfig,
     pub require_registered_claim_type: bool,
+    pub multisig_ttl_days: u32,
 }
 
 #[contracttype]

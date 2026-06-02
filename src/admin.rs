@@ -349,14 +349,20 @@ pub fn set_require_registered_claim_type(env: &Env, admin: Address, require: boo
     
     let mut config = Storage::get_contract_config(env).unwrap_or_else(|| {
         ContractConfig {
-            ttl_config: Storage::get_ttl_config(env).unwrap_or(TtlConfig { ttl_days: 30 }),
-            limits: Storage::get_limits(env),
+            contract_name: String::from_str(env, "TrustLink"),
+            contract_version: Storage::get_version(env).unwrap_or(String::from_str(env, "")),
+            contract_description: String::from_str(
+                env,
+                "On-chain attestation and verification system for the Stellar blockchain.",
+            ),
             fee_config: Storage::get_fee_config(env).unwrap_or(FeeConfig {
                 attestation_fee: 0,
                 fee_collector: admin.clone(),
                 fee_token: None,
             }),
+            ttl_config: Storage::get_ttl_config(env).unwrap_or(TtlConfig { ttl_days: 30 }),
             require_registered_claim_type: false,
+            multisig_ttl_days: 7,
         }
     });
     

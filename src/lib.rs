@@ -25,15 +25,16 @@ use soroban_sdk::{contract, contractimpl, token::TokenClient, Address, Env, Stri
 use crate::constants::SECS_PER_DAY;
 use crate::events::Events;
 use crate::storage::Storage;
+use crate::callback::ExpirationCallbackClient;
+use crate::attestation::{validate_reason, validate_source_reference};
 use crate::types::{
     AdminCouncil, AttestationTemplate, Attestation, AttestationOrigin, AttestationRequest,
     AttestationStatus, AuditAction, AuditEntry, ClaimTypeInfo, ContractConfig, ContractMetadata,
-    CouncilOperation, CouncilProposal, Delegation, Error, FeeConfig, GlobalStats,
+    CouncilOperation, CouncilProposal, Delegation, Endorsement, Error, FeeConfig, GlobalStats,
     HealthStatus, IssuerMetadata, IssuerStats, IssuerTier, MultiSigProposal, PendingAdminTransfer,
     RateLimitConfig, RequestStatus, StorageLimits, TtlConfig, ATTESTATION_REQUEST_TTL_SECS,
     MULTISIG_PROPOSAL_TTL_SECS,
 };
-use crate::validation::Validation;
 
 const MAX_SOURCE_CHAIN_LEN: u32 = 32;
 const MAX_SOURCE_TX_LEN: u32 = 128;
@@ -147,16 +148,6 @@ fn maybe_trigger_expiration_hook(
         let _ = client.try_notify_expiring(subject, attestation_id, &expiration);
     }
 }
-use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
-
-use crate::events::Events;
-use crate::storage::Storage;
-use crate::types::{
-    AdminCouncil, Attestation, AttestationRequest, AttestationStatus, AttestationTemplate,
-    AuditEntry, Delegation, Endorsement, Error, ExpirationHook, FeeConfig, GlobalStats,
-    HealthStatus, IssuerMetadata, IssuerStats, IssuerTier, MultiSigProposal, PendingAdminTransfer,
-    RateLimitConfig, StorageLimits,
-};
 
 #[contract]
 pub struct TrustLinkContract;
@@ -273,32 +264,8 @@ impl TrustLinkContract {
         admin::is_whitelist_enabled(&env, issuer)
     }
 
-    pub fn set_issuer_tier(
-        env: Env,
-        admin: Address,
-        issuer: Address,
-        tier: IssuerTier,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-        Validation::require_admin(&env, &admin)?;
-        Validation::require_issuer(&env, &issuer)?;
-        Storage::set_issuer_tier(&env, &issuer, &tier);
-        Events::issuer_tier_updated(&env, &issuer, &tier);
-        Ok(())
-    }
 
     /// Return a confidence score (0–100) based on issuer tier + endorsements.
-    pub fn get_confidence_score(env: Env, attestation_id: String) -> Option<u32> {
-        let attestation = Storage::get_attestation(&env, &attestation_id).ok()?;
-        let tier_score = match Storage::get_issuer_tier(&env, &attestation.issuer) {
-            Some(IssuerTier::Premium) => 90u32,
-            Some(IssuerTier::Verified) => 60u32,
-            Some(IssuerTier::Basic) | None => 30u32,
-        };
-        let endorsements = Storage::get_endorsements(&env, &attestation_id);
-        let endorsement_bonus = (endorsements.len() * 2).min(10) as u32;
-        Some(tier_score + endorsement_bonus)
-    }
 
     pub fn set_issuer_tier(env: Env, admin: Address, issuer: Address, tier: IssuerTier) -> Result<(), Error> {
         admin::set_issuer_tier(&env, admin, issuer, tier)
@@ -312,9 +279,6 @@ impl TrustLinkContract {
         admin::get_issuer_metadata(&env, issuer)
     }
 
-    pub fn set_issuer_metadata(env: Env, issuer: Address, metadata: IssuerMetadata) -> Result<(), Error> {
-        admin::set_issuer_metadata(&env, issuer, metadata)
-    }
 
     #[must_use]
     pub fn get_issuer_stats(env: Env, issuer: Address) -> IssuerStats {
@@ -395,9 +359,6 @@ impl TrustLinkContract {
     // Fee & rate limit
     // -----------------------------------------------------------------------
 
-    pub fn get_fee_config(env: Env) -> Result<FeeConfig, Error> {
-        admin::get_fee_config(&env)
-    }
 
     pub fn set_fee(env: Env, admin: Address, fee: i128, collector: Address, fee_token: Option<Address>) -> Result<(), Error> {
         admin::set_fee(&env, admin, fee, collector, fee_token)
@@ -488,23 +449,14 @@ impl TrustLinkContract {
     // Contract Config
     // -----------------------------------------------------------------------
 
-    pub fn set_registered_claim_type(env: Env, admin: Address, require: bool) -> Result<(), Error> {
-        admin::set_require_registered_claim_type(&env, admin, require)
-    }
 
     #[must_use]
-    pub fn get_registered_claim_type(env: Env) -> bool {
-        admin::get_require_registered_claim_type(&env)
-    }
 
     // -----------------------------------------------------------------------
     // Limits
     // -----------------------------------------------------------------------
 
     #[must_use]
-    pub fn get_limits(env: Env) -> StorageLimits {
-        admin::get_limits(&env)
-    }
 
     pub fn set_limits(env: Env, admin: Address, max_attestations_per_issuer: u32, max_attestations_per_subject: u32) -> Result<(), Error> {
         admin::set_limits(&env, admin, max_attestations_per_issuer, max_attestations_per_subject)
@@ -558,45 +510,11 @@ impl TrustLinkContract {
     // Expiration hooks
     // -----------------------------------------------------------------------
 
-    pub fn register_expiration_hook(env: Env, subject: Address, callback_contract: Address, notify_days_before: u32) -> Result<(), Error> {
-        admin::register_expiration_hook(&env, subject, callback_contract, notify_days_before)
-    }
 
     #[must_use]
-    pub fn get_expiration_hook(env: Env, subject: Address) -> Option<ExpirationHook> {
-        admin::get_expiration_hook(&env, subject)
-    }
 
     /// Internal: execute the action encoded in a council proposal.
-    fn execute_council_action(
-        env: &Env,
-        action: &CouncilAction,
-        proposer: &Address,
-    ) -> Result<(), Error> {
-        match action {
-            CouncilAction::Pause => {
-                Storage::set_paused(env, true);
-                Events::contract_paused(env, proposer, env.ledger().timestamp(), &None);
-            }
-            CouncilAction::Unpause => {
-                Storage::set_paused(env, false);
-                Events::contract_unpaused(env, proposer, env.ledger().timestamp());
-            }
-            CouncilAction::SetFee(fee_config) => {
-                Storage::set_fee_config(env, fee_config);
-            }
-            CouncilAction::RemoveIssuer(issuer) => {
-                Storage::remove_issuer(env, issuer);
-                Storage::decrement_total_issuers(env);
-                Events::issuer_removed(env, issuer, proposer, env.ledger().timestamp());
-            }
-        }
-        Ok(())
-    }
 
-    pub fn remove_expiration_hook(env: Env, subject: Address) -> Result<(), Error> {
-        admin::remove_expiration_hook(&env, subject)
-    }
 
     // -----------------------------------------------------------------------
     // Attestation creation
@@ -885,9 +803,6 @@ impl TrustLinkContract {
         attestation::transfer_attestation(&env, admin, attestation_id, new_issuer)
     }
 
-    pub fn request_deletion(env: Env, subject: Address, attestation_id: String) -> Result<(), Error> {
-        attestation::request_deletion(&env, subject, attestation_id)
-    }
 
     pub fn endorse_attestation(env: Env, endorser: Address, attestation_id: String) -> Result<(), Error> {
         attestation::endorse_attestation(&env, endorser, attestation_id)
@@ -1001,26 +916,7 @@ impl TrustLinkContract {
         after_attestation_id: Option<String>,
         limit: u32,
     ) -> Vec<Attestation> {
-        let attestation_ids = Storage::get_subject_attestations(&env, &subject);
-        let mut filtered = Vec::new(&env);
-        for id in attestation_ids.iter() {
-            if let Ok(attestation) = Storage::get_attestation(&env, &id) {
-                if !attestation.deleted
-                    && attestation.timestamp >= from_ts
-                    && attestation.timestamp <= to_ts
-                {
-                    filtered.push_back(id);
-                }
-            }
-        }
-        let paginated_ids = crate::storage::paginate(&env, &filtered, start, limit);
-        let mut result = Vec::new(&env);
-        for id in paginated_ids.iter() {
-            if let Ok(attestation) = Storage::get_attestation(&env, &id) {
-                result.push_back(attestation);
-            }
-        }
-        result
+        query::get_attestations_in_range_after(&env, subject, from_ts, to_ts, after_attestation_id, limit)
     }
 
     #[must_use]
@@ -1103,9 +999,6 @@ impl TrustLinkContract {
     }
 
     #[must_use]
-    pub fn get_global_stats(env: Env) -> GlobalStats {
-        query::get_global_stats(&env)
-    }
 
     pub fn set_issuer_metadata(
         env: Env,
@@ -1122,30 +1015,11 @@ impl TrustLinkContract {
     // Multi-sig
     // -----------------------------------------------------------------------
 
-    pub fn propose_attestation(
-        env: Env,
-        proposer: Address,
-        subject: Address,
-        claim_type: String,
-        required_signers: Vec<Address>,
-        threshold: u32,
-    ) -> Result<String, Error> {
-        multisig::propose_attestation(&env, proposer, subject, claim_type, required_signers, threshold)
-    }
 
-    pub fn cosign_attestation(env: Env, issuer: Address, proposal_id: String) -> Result<(), Error> {
-        multisig::cosign_attestation(&env, issuer, proposal_id)
-    }
 
     #[must_use]
-    pub fn get_multisig_proposal(env: Env, proposal_id: String) -> Result<MultiSigProposal, Error> {
-        multisig::get_multisig_proposal(&env, proposal_id)
-    }
 
     #[must_use]
-    pub fn get_multisig_ttl(env: Env) -> u32 {
-        multisig::get_multisig_ttl(&env)
-    }
 
     pub fn register_expiration_hook(
         env: Env,
@@ -1188,25 +1062,13 @@ impl TrustLinkContract {
         request::request_attestation(&env, subject, issuer, claim_type)
     }
 
-    pub fn fulfill_request(env: Env, issuer: Address, request_id: String, expiration: Option<u64>) -> Result<String, Error> {
-        request::fulfill_request(&env, issuer, request_id, expiration)
-    }
 
-    pub fn reject_request(env: Env, issuer: Address, request_id: String, reason: Option<String>) -> Result<(), Error> {
-        request::reject_request(&env, issuer, request_id, reason)
-    }
 
     pub fn cancel_request(env: Env, subject: Address, request_id: String) -> Result<(), Error> {
         request::cancel_request(&env, subject, request_id)
     }
 
-    pub fn get_pending_requests(env: Env, issuer: Address, start: u32, limit: u32) -> Vec<AttestationRequest> {
-        request::get_pending_requests(&env, issuer, start, limit)
-    }
 
-    pub fn get_request(env: Env, request_id: String) -> Result<AttestationRequest, Error> {
-        request::get_request(&env, request_id)
-    }
 
     /// Alias for `get_request`.
     pub fn get_attestation_request(env: Env, request_id: String) -> Result<AttestationRequest, Error> {
@@ -1218,14 +1080,8 @@ impl TrustLinkContract {
     // -----------------------------------------------------------------------
 
     #[must_use]
-    pub fn get_version(env: Env) -> Result<String, Error> {
-        admin::get_version(&env)
-    }
 
     #[must_use]
-    pub fn health_check(env: Env) -> HealthStatus {
-        admin::health_check(&env)
-    }
 
     // -----------------------------------------------------------------------
     // Attestation templates (issue #529)
@@ -1239,7 +1095,7 @@ impl TrustLinkContract {
     ///
     /// # Errors
     /// - [`Error::Unauthorized`] — caller is not admin.
-    pub fn set_require_registered_claim_type(
+    pub fn set_registered_claim_type(
         env: Env,
         admin: Address,
         required: bool,
@@ -1252,7 +1108,7 @@ impl TrustLinkContract {
 
     /// Return `true` if `create_template` enforces registered claim types.
     #[must_use]
-    pub fn get_require_registered_claim_type(env: Env) -> bool {
+    pub fn get_registered_claim_type(env: Env) -> bool {
         Storage::get_require_registered_claim_type(&env)
     }
 
@@ -1299,13 +1155,6 @@ impl TrustLinkContract {
 
     /// Retrieve a template owned by `issuer` with the given `name`, or `None`.
     #[must_use]
-    pub fn get_template(
-        env: Env,
-        issuer: Address,
-        name: String,
-    ) -> Option<AttestationTemplate> {
-        Storage::get_attestation_template(&env, &issuer, &name)
-    }
 
     // -----------------------------------------------------------------------
     // Multi-sig attestation proposals
@@ -1688,46 +1537,67 @@ impl TrustLinkContract {
     pub fn create_attestation_from_template(
         env: Env,
         issuer: Address,
-        claim_type: String,
+        template_id: String,
+        subject: Address,
+        expiration_override: Option<u64>,
+        metadata_override: Option<String>,
     ) -> Result<String, Error> {
         subject.require_auth();
         Validation::require_not_paused(&env)?;
         Validation::require_issuer(&env, &issuer)?;
-        validate_claim_type(&claim_type)?;
+
+        let template = Storage::get_template(&env, &issuer, &template_id).ok_or(Error::NotFound)?;
+        let claim_type = template.claim_type.clone();
 
         let timestamp = env.ledger().timestamp();
-        let request_id =
-            AttestationRequest::generate_id(&env, &subject, &issuer, &claim_type, timestamp);
 
-        if Storage::get_request(&env, &request_id).is_ok() {
+        // Create an attestation ID and attestation directly based on template + overrides.
+        let attestation_id = Attestation::generate_id(&env, &issuer, &subject, &claim_type, timestamp);
+
+        if Storage::has_attestation(&env, &attestation_id) {
             return Err(Error::DuplicateAttestation);
         }
 
-        let expires_at = timestamp + ATTESTATION_REQUEST_TTL_SECS;
-
-        let request = AttestationRequest {
-            id: request_id.clone(),
-            subject: subject.clone(),
-            issuer: issuer.clone(),
-            claim_type: claim_type.clone(),
-            timestamp,
-            expires_at,
-            status: RequestStatus::Pending,
-            rejection_reason: None,
+        let expiration = if let Some(e) = expiration_override {
+            validate_native_expiration(&env, Some(e))?;
+            Some(e)
+        } else if let Some(days) = template.default_expiration_days {
+            Some(timestamp + days * SECS_PER_DAY)
+        } else {
+            None
         };
 
-        Storage::set_request(&env, &request);
-        Storage::add_pending_request(&env, &issuer, &request_id);
-        Events::attestation_requested(
-            &env,
-            &request_id,
-            &subject,
-            &issuer,
-            &claim_type,
-            expires_at,
-        );
+        if let Some(ref md) = metadata_override {
+            if md.len() > 256 {
+                return Err(Error::MetadataTooLong);
+            }
+        }
 
-        Ok(request_id)
+        let attestation = Attestation {
+            id: attestation_id.clone(),
+            issuer: issuer.clone(),
+            subject: subject.clone(),
+            claim_type: claim_type.clone(),
+            timestamp,
+            expiration,
+            revoked: false,
+            metadata: metadata_override.or(template.metadata_template.clone()),
+            jurisdiction: None,
+            valid_from: None,
+            origin: AttestationOrigin::Native,
+            source_chain: None,
+            source_tx: None,
+            tags: None,
+            revocation_reason: None,
+            deleted: false,
+        };
+
+        Storage::set_attestation(&env, &attestation);
+        Storage::add_issuer_attestation(&env, &issuer, &attestation_id);
+        Storage::add_subject_attestation(&env, &subject, &attestation_id);
+        Events::attestation_created(&env, &attestation_id, &issuer, &subject, expiration);
+
+        Ok(attestation_id)
     }
 
     pub fn fulfill_request(
@@ -1744,6 +1614,8 @@ impl TrustLinkContract {
 
         let template = Storage::get_template(&env, &issuer, &template_id)
             .ok_or(Error::NotFound)?;
+
+        let mut request = Storage::get_request(&env, &request_id).ok_or(Error::NotFound)?;
 
         if request.issuer != issuer {
             return Err(Error::Unauthorized);
@@ -1937,13 +1809,6 @@ impl TrustLinkContract {
     ///
     /// # Errors
     /// - [`Error::NotFound`] — `template_id` does not exist for this issuer.
-    pub fn get_template(
-        env: Env,
-        issuer: Address,
-        template_id: String,
-    ) -> Result<AttestationTemplate, Error> {
-        Storage::get_template(&env, &issuer, &template_id).ok_or(Error::NotFound)
-    }
 
     // -----------------------------------------------------------------------
     // Issue #530: Template management
